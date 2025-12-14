@@ -42,7 +42,7 @@ function ReferenceCheck<T extends Document>(
         });
       }
 
-      // Handle array of references
+      // Handle array of references (simple array like [ObjectId])
       if (path instanceof Schema.Types.Array && path.schema) {
         for (const subField in path.schema.paths) {
           const subPath = path.schema.paths[subField];
@@ -70,6 +70,41 @@ function ReferenceCheck<T extends Document>(
     }
 
     return refFields;
+  }
+
+  // Helper function to extract values from nested structures
+  function extractNestedValue(
+    data: any,
+    fieldPath: string
+  ): Types.ObjectId | Types.ObjectId[] | undefined {
+    if (!fieldPath.includes(".")) {
+      return data[fieldPath];
+    }
+
+    const parts = fieldPath.split(".");
+
+    // Handle array of objects with nested field (e.g., "p.a" where p is an array)
+    if (parts.length === 2) {
+      const [parentField, childField] = parts;
+      const parentValue = data[parentField];
+
+      if (!parentValue) return undefined;
+
+      // If parent is an array of objects, extract all child values
+      if (Array.isArray(parentValue)) {
+        const values = parentValue
+          .map((item) => item?.[childField])
+          .filter((val) => val !== undefined && val !== null);
+        return values.length > 0 ? values : undefined;
+      }
+
+      // If parent is a single object, get the child value
+      if (typeof parentValue === "object" && parentValue !== null) {
+        return parentValue[childField];
+      }
+    }
+
+    return undefined;
   }
 
   // Helper function to validate single reference
@@ -120,9 +155,17 @@ function ReferenceCheck<T extends Document>(
         log(`Validating ${refFields.length} reference fields on save`);
 
         for (const fieldObj of refFields) {
-          const value = this.get(fieldObj.field) as
-            | Types.ObjectId
-            | Types.ObjectId[];
+          let value: Types.ObjectId | Types.ObjectId[] | undefined;
+
+          // Use extractNestedValue for both simple and nested fields
+          if (fieldObj.field.includes(".")) {
+            value = extractNestedValue(this.toObject(), fieldObj.field);
+          } else {
+            value = this.get(fieldObj.field) as
+              | Types.ObjectId
+              | Types.ObjectId[];
+          }
+
           if (!value) continue;
 
           const model = this.model(fieldObj.refTo);
@@ -160,16 +203,16 @@ function ReferenceCheck<T extends Document>(
         log(`Validating ${refFields.length} reference fields on update`);
 
         for (const fieldObj of refFields) {
-          // Handle nested fields (e.g., "item.deviceId")
+          // Handle nested fields (e.g., "item.deviceId" or "p.a" where p is array)
           let value: Types.ObjectId | Types.ObjectId[] | undefined;
 
           if (fieldObj.field.includes(".")) {
-            const parts = fieldObj.field.split(".");
-            // Check if the value exists in the payload using nested path
+            // First check dot-notation in payload (e.g., {"p.a": value})
             if (payload[fieldObj.field]) {
               value = payload[fieldObj.field];
-            } else if (parts.length === 2 && payload[parts[0]]) {
-              value = payload[parts[0]][parts[1]];
+            } else {
+              // Then check nested structure (e.g., {p: [{a: value}]})
+              value = extractNestedValue(payload, fieldObj.field);
             }
           } else {
             value = payload[fieldObj.field] as
@@ -293,7 +336,14 @@ function ReferenceCheck<T extends Document>(
     const results: ValidationResult[] = [];
 
     for (const fieldObj of refFields) {
-      const value = data[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
+      let value: Types.ObjectId | Types.ObjectId[] | undefined;
+
+      if (fieldObj.field.includes(".")) {
+        value = extractNestedValue(data, fieldObj.field);
+      } else {
+        value = data[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
+      }
+
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
@@ -318,9 +368,14 @@ function ReferenceCheck<T extends Document>(
     const results: ValidationResult[] = [];
 
     for (const fieldObj of refFields) {
-      const value = this.get(fieldObj.field) as
-        | Types.ObjectId
-        | Types.ObjectId[];
+      let value: Types.ObjectId | Types.ObjectId[] | undefined;
+
+      if (fieldObj.field.includes(".")) {
+        value = extractNestedValue(this.toObject(), fieldObj.field);
+      } else {
+        value = this.get(fieldObj.field) as Types.ObjectId | Types.ObjectId[];
+      }
+
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
