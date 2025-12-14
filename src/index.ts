@@ -54,6 +54,19 @@ function ReferenceCheck<T extends Document>(
           }
         }
       }
+      
+      // Handle first-level nested objects with ObjectId references
+      // For fields like "item.deviceId" where item is an object
+      if (field.includes('.')) {
+        const parts = field.split('.');
+        // Only handle first-level nesting (e.g., item.deviceId)
+        if (parts.length === 2 && path.options.ref) {
+          refFields.push({
+            field,
+            refTo: path.options.ref as string,
+          });
+        }
+      }
     }
     
     return refFields;
@@ -151,7 +164,21 @@ function ReferenceCheck<T extends Document>(
         log(`Validating ${refFields.length} reference fields on update`);
 
         for (const fieldObj of refFields) {
-          const value = payload[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
+          // Handle nested fields (e.g., "item.deviceId")
+          let value: Types.ObjectId | Types.ObjectId[] | undefined;
+          
+          if (fieldObj.field.includes('.')) {
+            const parts = fieldObj.field.split('.');
+            // Check if the value exists in the payload using nested path
+            if (payload[fieldObj.field]) {
+              value = payload[fieldObj.field];
+            } else if (parts.length === 2 && payload[parts[0]]) {
+              value = payload[parts[0]][parts[1]];
+            }
+          } else {
+            value = payload[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
+          }
+          
           if (!value) continue;
 
           const model = this.model.db.model(fieldObj.refTo);
@@ -232,13 +259,17 @@ function ReferenceCheck<T extends Document>(
         for (const refModel of refModels) {
           const model = this.model.db.model(refModel.modelName);
 
+          // Build match conditions for both direct and nested fields
+          const matchConditions = refModel.fields.map((field) => {
+            // For nested fields like "item.deviceId", use dot notation in MongoDB query
+            return { [field]: deletingItem._id };
+          });
+
           // Use aggregation for better performance
           const pipeline = [
             {
               $match: {
-                $or: refModel.fields.map((field) => ({
-                  [field]: deletingItem._id,
-                })),
+                $or: matchConditions,
               },
             },
             { $limit: 1 },
