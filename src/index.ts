@@ -1,17 +1,17 @@
-import { Schema, Document, Types, Query } from 'mongoose';
-import type { 
-  ReferenceCheckOptions, 
-  RefField, 
-  ValidationResult, 
-  RefModel 
-} from './types';
+import { Schema, Document, Types, Query } from "mongoose";
+import type {
+  ReferenceCheckOptions,
+  RefField,
+  ValidationResult,
+  RefModel,
+} from "./types";
 
 export type {
   ReferenceCheckOptions,
   RefField,
   ValidationResult,
-  RefModel
-} from './types';
+  RefModel,
+} from "./types";
 
 function ReferenceCheck<T extends Document>(
   schema: Schema<T>,
@@ -30,10 +30,10 @@ function ReferenceCheck<T extends Document>(
   // Helper function to get reference fields from schema
   function getRefFields(schema: Schema): RefField[] {
     const refFields: RefField[] = [];
-    
+
     for (const field in schema.paths) {
       const path = schema.paths[field];
-      
+
       // Handle direct reference
       if (path.options.ref) {
         refFields.push({
@@ -41,7 +41,7 @@ function ReferenceCheck<T extends Document>(
           refTo: path.options.ref as string,
         });
       }
-      
+
       // Handle array of references
       if (path instanceof Schema.Types.Array && path.schema) {
         for (const subField in path.schema.paths) {
@@ -54,8 +54,21 @@ function ReferenceCheck<T extends Document>(
           }
         }
       }
+
+      // Handle first-level nested objects with ObjectId references
+      // For fields like "item.deviceId" where item is an object
+      if (field.includes(".")) {
+        const parts = field.split(".");
+        // Only handle first-level nesting (e.g., item.deviceId)
+        if (parts.length === 2 && path.options.ref) {
+          refFields.push({
+            field,
+            refTo: path.options.ref as string,
+          });
+        }
+      }
     }
-    
+
     return refFields;
   }
 
@@ -73,9 +86,9 @@ function ReferenceCheck<T extends Document>(
         if (value.length === 0) return true;
 
         // Batch check for arrays
-        const uniqueValues = [...new Set(value.map(v => v.toString()))];
-        const count = await model.countDocuments({ 
-          _id: { $in: uniqueValues } 
+        const uniqueValues = [...new Set(value.map((v) => v.toString()))];
+        const count = await model.countDocuments({
+          _id: { $in: uniqueValues },
         });
         return count === uniqueValues.length;
       }
@@ -99,7 +112,7 @@ function ReferenceCheck<T extends Document>(
 
   // Save middleware
   if (config.enableSave) {
-    schema.pre<T>('save', async function (next) {
+    schema.pre<T>("save", async function (next) {
       try {
         const refFields = getRefFields(this.schema);
         if (refFields.length === 0) return next();
@@ -107,15 +120,13 @@ function ReferenceCheck<T extends Document>(
         log(`Validating ${refFields.length} reference fields on save`);
 
         for (const fieldObj of refFields) {
-          const value = this.get(fieldObj.field) as Types.ObjectId | Types.ObjectId[];
+          const value = this.get(fieldObj.field) as
+            | Types.ObjectId
+            | Types.ObjectId[];
           if (!value) continue;
 
           const model = this.model(fieldObj.refTo);
-          const isValid = await validateReference(
-            model,
-            value,
-            fieldObj.field
-          );
+          const isValid = await validateReference(model, value, fieldObj.field);
 
           if (!isValid) {
             throw new Error(
@@ -124,7 +135,7 @@ function ReferenceCheck<T extends Document>(
           }
         }
 
-        log('Save validation completed successfully');
+        log("Save validation completed successfully");
         next();
       } catch (error: any) {
         next(error);
@@ -134,11 +145,9 @@ function ReferenceCheck<T extends Document>(
 
   // Update middlewares
   if (config.enableUpdate) {
-    const updateOperations: Array<'findOneAndUpdate' | 'updateOne' | 'updateMany'> = [
-      'findOneAndUpdate', 
-      'updateOne', 
-      'updateMany'
-    ];
+    const updateOperations: Array<
+      "findOneAndUpdate" | "updateOne" | "updateMany"
+    > = ["findOneAndUpdate", "updateOne", "updateMany"];
 
     schema.pre<Query<any, T>>(updateOperations, async function (next) {
       try {
@@ -151,15 +160,27 @@ function ReferenceCheck<T extends Document>(
         log(`Validating ${refFields.length} reference fields on update`);
 
         for (const fieldObj of refFields) {
-          const value = payload[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
+          // Handle nested fields (e.g., "item.deviceId")
+          let value: Types.ObjectId | Types.ObjectId[] | undefined;
+
+          if (fieldObj.field.includes(".")) {
+            const parts = fieldObj.field.split(".");
+            // Check if the value exists in the payload using nested path
+            if (payload[fieldObj.field]) {
+              value = payload[fieldObj.field];
+            } else if (parts.length === 2 && payload[parts[0]]) {
+              value = payload[parts[0]][parts[1]];
+            }
+          } else {
+            value = payload[fieldObj.field] as
+              | Types.ObjectId
+              | Types.ObjectId[];
+          }
+
           if (!value) continue;
 
           const model = this.model.db.model(fieldObj.refTo);
-          const isValid = await validateReference(
-            model,
-            value,
-            fieldObj.field
-          );
+          const isValid = await validateReference(model, value, fieldObj.field);
 
           if (!isValid) {
             throw new Error(
@@ -168,7 +189,7 @@ function ReferenceCheck<T extends Document>(
           }
         }
 
-        log('Update validation completed successfully');
+        log("Update validation completed successfully");
         next();
       } catch (error: any) {
         next(error);
@@ -178,11 +199,9 @@ function ReferenceCheck<T extends Document>(
 
   // Delete middleware with performance optimization
   if (config.enableDelete) {
-    const deleteOperations: Array<'deleteOne' | 'findOneAndDelete' | 'deleteMany'> = [
-      'deleteOne', 
-      'findOneAndDelete', 
-      'deleteMany'
-    ];
+    const deleteOperations: Array<
+      "deleteOne" | "findOneAndDelete" | "deleteMany"
+    > = ["deleteOne", "findOneAndDelete", "deleteMany"];
 
     schema.pre<Query<any, T>>(deleteOperations, async function (next) {
       try {
@@ -194,7 +213,7 @@ function ReferenceCheck<T extends Document>(
         // Get the item being deleted
         const deletingItem = await this.model.findOne(query);
         if (!deletingItem) {
-          log('No item found to delete, skipping reference check');
+          log("No item found to delete, skipping reference check");
           return next();
         }
 
@@ -224,7 +243,7 @@ function ReferenceCheck<T extends Document>(
         }
 
         if (refModels.length === 0) {
-          log('No references found, safe to delete');
+          log("No references found, safe to delete");
           return next();
         }
 
@@ -232,13 +251,17 @@ function ReferenceCheck<T extends Document>(
         for (const refModel of refModels) {
           const model = this.model.db.model(refModel.modelName);
 
+          // Build match conditions for both direct and nested fields
+          const matchConditions = refModel.fields.map((field) => {
+            // For nested fields like "item.deviceId", use dot notation in MongoDB query
+            return { [field]: deletingItem._id };
+          });
+
           // Use aggregation for better performance
           const pipeline = [
             {
               $match: {
-                $or: refModel.fields.map((field) => ({
-                  [field]: deletingItem._id,
-                })),
+                $or: matchConditions,
               },
             },
             { $limit: 1 },
@@ -253,7 +276,7 @@ function ReferenceCheck<T extends Document>(
           }
         }
 
-        log('Delete validation completed successfully');
+        log("Delete validation completed successfully");
         next();
       } catch (error: any) {
         next(error);
@@ -274,11 +297,7 @@ function ReferenceCheck<T extends Document>(
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
-      const isValid = await validateReference(
-        model,
-        value,
-        fieldObj.field
-      );
+      const isValid = await validateReference(model, value, fieldObj.field);
 
       results.push({
         field: fieldObj.field,
@@ -299,15 +318,13 @@ function ReferenceCheck<T extends Document>(
     const results: ValidationResult[] = [];
 
     for (const fieldObj of refFields) {
-      const value = this.get(fieldObj.field) as Types.ObjectId | Types.ObjectId[];
+      const value = this.get(fieldObj.field) as
+        | Types.ObjectId
+        | Types.ObjectId[];
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
-      const isValid = await validateReference(
-        model,
-        value,
-        fieldObj.field
-      );
+      const isValid = await validateReference(model, value, fieldObj.field);
 
       results.push({
         field: fieldObj.field,
