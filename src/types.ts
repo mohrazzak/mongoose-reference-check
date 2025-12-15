@@ -1,4 +1,4 @@
-import { Types } from 'mongoose';
+import { Types } from "mongoose";
 
 export interface ReferenceCheckOptions {
   enableSave?: boolean;
@@ -6,11 +6,13 @@ export interface ReferenceCheckOptions {
   enableDelete?: boolean;
   enableLogging?: boolean;
   batchSize?: number;
+  orgScopedField?: string;
 }
 
 export interface RefField {
   field: string;
   refTo: string;
+  refCheckFilter?: Record<string, any>;
 }
 
 export interface ValidationResult {
@@ -25,7 +27,7 @@ export interface RefModel {
   fields: string[];
 }
 
-declare module 'mongoose' {
+declare module "mongoose" {
   interface Document {
     checkReferences(): Promise<ValidationResult[]>;
   }

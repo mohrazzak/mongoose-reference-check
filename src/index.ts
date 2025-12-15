@@ -1,4 +1,4 @@
-import { Schema, Document, Types, Query } from "mongoose";
+import mongoose, { Schema, Document, Types, Query } from "mongoose";
 import type {
   ReferenceCheckOptions,
   RefField,
@@ -18,14 +18,27 @@ function ReferenceCheck<T extends Document>(
   options: ReferenceCheckOptions = {}
 ): void {
   // Default configuration
-  const config: Required<ReferenceCheckOptions> = {
-    enableSave: true,
-    enableUpdate: true,
-    enableDelete: true,
+  const config = {
+    enableSave: false,
+    enableUpdate: false,
+    enableDelete: false,
     enableLogging: false,
     batchSize: 100,
+    orgScopedField: undefined as string | undefined,
     ...options,
   };
+
+  // Helper function to check if a model has the orgId field
+  function modelHasOrgId(modelName: string): boolean {
+    try {
+      if (!config.orgScopedField) return false;
+      const refModel = mongoose.model(modelName);
+      if (!refModel) return false;
+      return !!refModel.schema.path(config.orgScopedField);
+    } catch (error) {
+      return false;
+    }
+  }
 
   // Helper function to get reference fields from schema
   function getRefFields(schema: Schema): RefField[] {
@@ -34,11 +47,13 @@ function ReferenceCheck<T extends Document>(
     for (const field in schema.paths) {
       const path = schema.paths[field];
 
+      if (path.options._skipRefCheck) continue;
       // Handle direct reference
       if (path.options.ref) {
         refFields.push({
           field,
           refTo: path.options.ref as string,
+          refCheckFilter: path.options._refCheckFilter,
         });
       }
 
@@ -50,11 +65,23 @@ function ReferenceCheck<T extends Document>(
             refFields.push({
               field,
               refTo: subPath.options.ref as string,
+              refCheckFilter: subPath.options._refCheckFilter,
             });
           }
         }
       }
-
+      if (path.instance === "Array" && path.schema) {
+        for (const subField in path.schema.paths) {
+          const subPath = path.schema.paths[subField];
+          if (subPath.options.ref) {
+            refFields.push({
+              field: `${field}.${subField}`,
+              refTo: subPath.options.ref as string,
+              refCheckFilter: subPath.options._refCheckFilter,
+            });
+          }
+        }
+      }
       // Handle first-level nested objects with ObjectId references
       // For fields like "item.deviceId" where item is an object
       if (field.includes(".")) {
@@ -64,6 +91,7 @@ function ReferenceCheck<T extends Document>(
           refFields.push({
             field,
             refTo: path.options.ref as string,
+            refCheckFilter: path.options._refCheckFilter,
           });
         }
       }
@@ -111,10 +139,32 @@ function ReferenceCheck<T extends Document>(
   async function validateReference(
     model: any,
     value: Types.ObjectId | Types.ObjectId[] | null | undefined,
-    fieldName: string
+    fieldName: string,
+    refCheckFilter?: Record<string, any>,
+    documentData?: any
   ): Promise<boolean> {
     try {
       if (!value) return true;
+
+      // Build query filter with additional conditions from _refCheckFilter
+      const baseFilter: Record<string, any> = {};
+      if (refCheckFilter) {
+        Object.assign(baseFilter, refCheckFilter);
+      }
+
+      // Add organization scoping if configured
+      if (config.orgScopedField && documentData) {
+        const orgId = documentData[config.orgScopedField];
+        const refModelName = model.modelName;
+
+        if (orgId && modelHasOrgId(refModelName)) {
+          // Allow public documents (no orgId) or documents within the same org
+          baseFilter.$or = [
+            { [config.orgScopedField]: { $exists: false } },
+            { [config.orgScopedField]: orgId },
+          ];
+        }
+      }
 
       // Handle array values
       if (Array.isArray(value)) {
@@ -124,12 +174,13 @@ function ReferenceCheck<T extends Document>(
         const uniqueValues = [...new Set(value.map((v) => v.toString()))];
         const count = await model.countDocuments({
           _id: { $in: uniqueValues },
+          ...baseFilter,
         });
         return count === uniqueValues.length;
       }
 
       // Single value check
-      const exists = await model.exists({ _id: value });
+      const exists = await model.exists({ _id: value, ...baseFilter });
       return exists !== null;
     } catch (error: any) {
       throw new Error(
@@ -147,42 +198,41 @@ function ReferenceCheck<T extends Document>(
 
   // Save middleware
   if (config.enableSave) {
-    schema.pre<T>("save", async function (next) {
-      try {
-        const refFields = getRefFields(this.schema);
-        if (refFields.length === 0) return next();
+    schema.pre<T>("save", async function () {
+      const refFields = getRefFields(this.schema);
+      if (refFields.length === 0) return;
 
-        log(`Validating ${refFields.length} reference fields on save`);
+      log(`Validating ${refFields.length} reference fields on save`);
 
-        for (const fieldObj of refFields) {
-          let value: Types.ObjectId | Types.ObjectId[] | undefined;
+      for (const fieldObj of refFields) {
+        let value: Types.ObjectId | Types.ObjectId[] | undefined;
 
-          // Use extractNestedValue for both simple and nested fields
-          if (fieldObj.field.includes(".")) {
-            value = extractNestedValue(this.toObject(), fieldObj.field);
-          } else {
-            value = this.get(fieldObj.field) as
-              | Types.ObjectId
-              | Types.ObjectId[];
-          }
-
-          if (!value) continue;
-
-          const model = this.model(fieldObj.refTo);
-          const isValid = await validateReference(model, value, fieldObj.field);
-
-          if (!isValid) {
-            throw new Error(
-              `Reference validation failed: The value ${value} does not exist within ${fieldObj.refTo}`
-            );
-          }
+        // Use extractNestedValue for both simple and nested fields
+        if (fieldObj.field.includes(".")) {
+          value = extractNestedValue(this.toObject(), fieldObj.field);
+        } else {
+          value = this.get(fieldObj.field) as Types.ObjectId | Types.ObjectId[];
         }
 
-        log("Save validation completed successfully");
-        next();
-      } catch (error: any) {
-        next(error);
+        if (!value) continue;
+
+        const model = this.model(fieldObj.refTo);
+        const isValid = await validateReference(
+          model,
+          value,
+          fieldObj.field,
+          fieldObj.refCheckFilter,
+          this.toObject()
+        );
+
+        if (!isValid) {
+          throw new Error(
+            `Reference validation failed: The value ${value} does not exist within ${fieldObj.refTo}`
+          );
+        }
       }
+
+      log("Save validation completed successfully");
     });
   }
 
@@ -192,51 +242,50 @@ function ReferenceCheck<T extends Document>(
       "findOneAndUpdate" | "updateOne" | "updateMany"
     > = ["findOneAndUpdate", "updateOne", "updateMany"];
 
-    schema.pre<Query<any, T>>(updateOperations, async function (next) {
-      try {
-        const payload = this.getUpdate() as Record<string, any>;
-        if (!payload) return next();
+    schema.pre<Query<any, T>>(updateOperations, async function () {
+      const payload = this.getUpdate() as Record<string, any>;
+      if (!payload) return;
 
-        const refFields = getRefFields(this.model.schema);
-        if (refFields.length === 0) return next();
+      const refFields = getRefFields(this.model.schema);
+      if (refFields.length === 0) return;
 
-        log(`Validating ${refFields.length} reference fields on update`);
+      log(`Validating ${refFields.length} reference fields on update`);
 
-        for (const fieldObj of refFields) {
-          // Handle nested fields (e.g., "item.deviceId" or "p.a" where p is array)
-          let value: Types.ObjectId | Types.ObjectId[] | undefined;
+      for (const fieldObj of refFields) {
+        // Handle nested fields (e.g., "item.deviceId" or "p.a" where p is array)
+        let value: Types.ObjectId | Types.ObjectId[] | undefined;
 
-          if (fieldObj.field.includes(".")) {
-            // First check dot-notation in payload (e.g., {"p.a": value})
-            if (payload[fieldObj.field]) {
-              value = payload[fieldObj.field];
-            } else {
-              // Then check nested structure (e.g., {p: [{a: value}]})
-              value = extractNestedValue(payload, fieldObj.field);
-            }
+        if (fieldObj.field.includes(".")) {
+          // First check dot-notation in payload (e.g., {"p.a": value})
+          if (payload[fieldObj.field]) {
+            value = payload[fieldObj.field];
           } else {
-            value = payload[fieldObj.field] as
-              | Types.ObjectId
-              | Types.ObjectId[];
+            // Then check nested structure (e.g., {p: [{a: value}]})
+            value = extractNestedValue(payload, fieldObj.field);
           }
-
-          if (!value) continue;
-
-          const model = this.model.db.model(fieldObj.refTo);
-          const isValid = await validateReference(model, value, fieldObj.field);
-
-          if (!isValid) {
-            throw new Error(
-              `Reference validation failed: The value ${value} does not exist within ${fieldObj.refTo}`
-            );
-          }
+        } else {
+          value = payload[fieldObj.field] as Types.ObjectId | Types.ObjectId[];
         }
 
-        log("Update validation completed successfully");
-        next();
-      } catch (error: any) {
-        next(error);
+        if (!value) continue;
+
+        const model = this.model.db.model(fieldObj.refTo);
+        const isValid = await validateReference(
+          model,
+          value,
+          fieldObj.field,
+          fieldObj.refCheckFilter,
+          payload
+        );
+
+        if (!isValid) {
+          throw new Error(
+            `Reference validation failed: The value ${value} does not exist within ${fieldObj.refTo}`
+          );
+        }
       }
+
+      log("Update validation completed successfully");
     });
   }
 
@@ -246,84 +295,80 @@ function ReferenceCheck<T extends Document>(
       "deleteOne" | "findOneAndDelete" | "deleteMany"
     > = ["deleteOne", "findOneAndDelete", "deleteMany"];
 
-    schema.pre<Query<any, T>>(deleteOperations, async function (next) {
-      try {
-        const deletingModelName = this.model.modelName;
-        const query = this.getQuery();
+    schema.pre<Query<any, T>>(deleteOperations, async function () {
+      const deletingModelName = this.model.modelName;
+      const query = this.getQuery();
 
-        log(`Checking references before deleting from ${deletingModelName}`);
+      log(`Checking references before deleting from ${deletingModelName}`);
 
-        // Get the item being deleted
-        const deletingItem = await this.model.findOne(query);
-        if (!deletingItem) {
-          log("No item found to delete, skipping reference check");
-          return next();
-        }
-
-        // Find all models that reference this model
-        const refModels: RefModel[] = [];
-        const allModelNames = this.model.db.modelNames();
-
-        for (const modelName of allModelNames) {
-          if (modelName === deletingModelName) continue;
-
-          const model = this.model.db.model(modelName);
-          const refFields: string[] = [];
-
-          for (const field in model.schema.paths) {
-            const path = model.schema.paths[field];
-            if (path.options.ref === deletingModelName) {
-              refFields.push(field);
-            }
-          }
-
-          if (refFields.length > 0) {
-            refModels.push({
-              modelName,
-              fields: refFields,
-            });
-          }
-        }
-
-        if (refModels.length === 0) {
-          log("No references found, safe to delete");
-          return next();
-        }
-
-        // Check references using optimized queries
-        for (const refModel of refModels) {
-          const model = this.model.db.model(refModel.modelName);
-
-          // Build match conditions for both direct and nested fields
-          const matchConditions = refModel.fields.map((field) => {
-            // For nested fields like "item.deviceId", use dot notation in MongoDB query
-            return { [field]: deletingItem._id };
-          });
-
-          // Use aggregation for better performance
-          const pipeline = [
-            {
-              $match: {
-                $or: matchConditions,
-              },
-            },
-            { $limit: 1 },
-          ];
-
-          const exists = await model.aggregate(pipeline);
-
-          if (exists.length > 0) {
-            throw new Error(
-              `Cannot delete record ${deletingItem._id}: It is referenced in ${refModel.modelName} model`
-            );
-          }
-        }
-
-        log("Delete validation completed successfully");
-        next();
-      } catch (error: any) {
-        next(error);
+      // Get the item being deleted
+      const deletingItem = await this.model.findOne(query);
+      if (!deletingItem) {
+        log("No item found to delete, skipping reference check");
+        return;
       }
+
+      // Find all models that reference this model
+      const refModels: RefModel[] = [];
+      const allModelNames = this.model.db.modelNames();
+
+      for (const modelName of allModelNames) {
+        if (modelName === deletingModelName) continue;
+
+        const model = this.model.db.model(modelName);
+        const refFields: string[] = [];
+
+        for (const field in model.schema.paths) {
+          const path = model.schema.paths[field];
+          if (path.options.ref === deletingModelName) {
+            refFields.push(field);
+          }
+        }
+
+        if (refFields.length > 0) {
+          refModels.push({
+            modelName,
+            fields: refFields,
+          });
+        }
+      }
+
+      if (refModels.length === 0) {
+        log("No references found, safe to delete");
+        return;
+      }
+
+      // Check references using optimized queries
+      for (const refModel of refModels) {
+        const model = this.model.db.model(refModel.modelName);
+
+        // Build match conditions for both direct and nested fields
+        const matchConditions = refModel.fields.map((field) => {
+          // For nested fields like "item.deviceId", use dot notation in MongoDB query
+          return { [field]: deletingItem._id };
+        });
+
+        // Use aggregation for better performance
+        const pipeline = [
+          {
+            $match: {
+              $or: matchConditions,
+            },
+          },
+          { $limit: 1 },
+        ];
+
+        const exists = await model.aggregate(pipeline);
+
+        if (exists.length > 0) {
+          throw new Error(
+            `Cannot delete record ${deletingItem._id}: It is referenced in ${refModel.modelName} model`
+          );
+        }
+      }
+
+      log("Delete validation completed successfully");
+      return;
     });
   }
 
@@ -347,7 +392,13 @@ function ReferenceCheck<T extends Document>(
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
-      const isValid = await validateReference(model, value, fieldObj.field);
+      const isValid = await validateReference(
+        model,
+        value,
+        fieldObj.field,
+        fieldObj.refCheckFilter,
+        data
+      );
 
       results.push({
         field: fieldObj.field,
@@ -379,7 +430,13 @@ function ReferenceCheck<T extends Document>(
       if (!value) continue;
 
       const model = this.model(fieldObj.refTo);
-      const isValid = await validateReference(model, value, fieldObj.field);
+      const isValid = await validateReference(
+        model,
+        value,
+        fieldObj.field,
+        fieldObj.refCheckFilter,
+        this.toObject()
+      );
 
       results.push({
         field: fieldObj.field,
